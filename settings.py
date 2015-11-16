@@ -7,6 +7,7 @@ user = 'test'
 password = None
 
 x10_switches = 'a1 a2 a8'
-x10_resend_timeout = 300
+x10_resend_timeout = 60
 
-mpower = {'plug01': ['http://192.168.0.220', 'ubnt', 'ubnt']}
+mpower = {'plug01': ['192.168.0.220', 'ubnt', 'ubnt']}
+mfi_resend_timeout = 30

@@ -7,13 +7,12 @@ import threading
 import paho.mqtt.client as mqtt
 
 import heyu
-import mfi
+import mfi_ssh
 import settings
 
 __author__ = 'madrider'
 
-
-LOG = logging.getLogger()
+LOG = logging.getLogger(__name__)
 
 
 def match_topic(mask, topic):
@@ -36,13 +35,15 @@ def match_topic(mask, topic):
     return True
 
 
-class X10Tester(object):
+class X10Tester(threading.Thread):
     resend_timeout = settings.x10_resend_timeout
     commands = []
     status = {}
     time = {}
 
     def __init__(self, publisher):
+        threading.Thread.__init__(self)
+        self.setDaemon(True)
         self.__gen = self.__next_command_generator()
         self.publisher = publisher
 
@@ -79,47 +80,66 @@ class X10Tester(object):
         self.publisher.publish('x10/%s' % addr.lower(), status, qos=0, retain=False)
 
 
-class MfiTester(object):
+class MfiTester(threading.Thread):
     commands = []
     status = {}
     time = {}
+    resend = settings.mfi_resend_timeout
 
     def __init__(self, publisher):
+        threading.Thread.__init__(self)
+        self.setDaemon(True)
         self.__gen = self.__next_command_generator()
         self.publisher = publisher
+        self.last_status = 0
+        self.tm = 15
 
     def __next_command_generator(self):
         while 1:
             for d in settings.mpower:
-                while self.commands:
-                    yield self.commands.pop()
                 yield (d, 0, 'status')
 
     def run(self):
         while 1:
             try:
                 self.cycle()
-            except Exception as e:
-                LOG.error('exception in mfi', e)
-            time.sleep(5)
+            except:
+                LOG.exception('exception in mfi')
+            time.sleep(0.1)
 
     def cycle(self):
-        name, port, cmd = self.__gen.__next__()
+        if self.commands:
+            c = self.commands[0]
+            self.do_cmd(*c)
+            self.commands.pop(0)
+        else:
+            if time.time() - self.last_status > self.tm:
+                self.last_status = time.time()
+                c = self.__gen.__next__()
+                self.do_cmd(*c)
+
+    def do_cmd(self, name, port, cmd):
         LOG.debug('%s %s', name, cmd)
         if name not in settings.mpower:
             LOG.error('invalid name %s', name)
             return
-        mp = mfi.MPower(*settings.mpower[name])
+        params = settings.mpower[name]
         if cmd == 'status':
-            d = mp.get_data()
-            LOG.debug('%s data: %s', name, d)
-            data = self.convert_data(d.get('sensors', []))
-            self.status[name] = data
-            if time.time() - self.time.get(name, 0) > 30:
-                self.time[name] = time.time()
-                self.send_data(name, data)
+            data = None
+            try:
+                data = mfi_ssh.get_all(*params)
+                self.status[name] = data
+                LOG.debug('%s data: %s', name, data)
+                if time.time() - self.time.get(name, 0) > self.resend:
+                    self.time[name] = time.time()
+                    self.send_data(name, data)
+            except:
+                LOG.exception('status')
         else:
-            mp.switch(port, cmd.lower() == 'on')
+            try:
+                mfi_ssh.switch(params[0], params[1], params[2], port, cmd.lower())
+            except:
+                LOG.exception('switch')
 
     def convert_data(self, data):
         conv_data = {}
@@ -130,6 +150,7 @@ class MfiTester(object):
 
     def send_data(self, name, data):
         for port in data:
+            LOG.debug(data)
             d = data[port]
             for cname in ('relay', 'voltage', 'current', 'power'):
                 if cname in d:
@@ -202,8 +223,8 @@ class Main(object):
         self.client.connect(self.server, self.port, 60)
         self.client.loop_start()
         try:
-            threading.Thread(name='x10', target=self.x10_tester.run, daemon=True).start()
-            threading.Thread(name='mfi', target=self.mfi_tester.run, daemon=True).start()
+            self.x10_tester.start()
+            self.mfi_tester.start()
             while 1:
                 time.sleep(1)
 
@@ -211,6 +232,7 @@ class Main(object):
             self.client.loop_stop()
 
     def publish(self, *args, **kw):
+        LOG.debug('sending to %s', args[0])
         self.client.publish(*args, **kw)
 
 
