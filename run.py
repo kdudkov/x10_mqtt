@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 
-import time
 import logging
+import signal
 import threading
+import time
+import traceback
 
 import paho.mqtt.client as mqtt
 
 import heyu
-import mfi_ssh
+import mfi
 import settings
 
 __author__ = 'madrider'
@@ -59,6 +61,16 @@ class X10Tester(threading.Thread):
             self.cycle()
             time.sleep(0.01)
 
+    def add_command(self, cmd):
+        i = 0
+        for c in self.commands[:]:
+            if c[0] == cmd[0]:
+                i += 1
+                self.commands.remove(c)
+        if i:
+            LOG.warn('removing %s commands for %s', i, cmd[0])
+        self.commands.append(cmd)
+
     def cycle(self):
         addr, cmd = self.__gen.__next__()
 
@@ -82,7 +94,7 @@ class X10Tester(threading.Thread):
 
 class MfiTester(threading.Thread):
     commands = []
-    status = {}
+    state = {}
     time = {}
     resend = settings.mfi_resend_timeout
 
@@ -93,6 +105,9 @@ class MfiTester(threading.Thread):
         self.publisher = publisher
         self.last_status = 0
         self.tm = 15
+        self.devices = {}
+        for k in settings.mpower.keys():
+            self.devices[k] = mfi.Mfi(*settings.mpower[k])
 
     def __next_command_generator(self):
         while 1:
@@ -118,30 +133,37 @@ class MfiTester(threading.Thread):
                 c = self.__gen.__next__()
                 self.do_cmd(*c)
 
+    def add_command(self, cmd):
+        i = 0
+        for c in self.commands[:]:
+            if c[0] == cmd[0] and c[1] == cmd[1]:
+                i += 1
+                self.commands.remove(c)
+        if i:
+            LOG.warn('removing %s commands for %s:%s', i, cmd[0], cmd[1])
+        self.commands.append(cmd)
+
     def do_cmd(self, name, port, cmd):
         LOG.debug('%s %s', name, cmd)
         if name not in settings.mpower:
             LOG.error('invalid name %s', name)
             return
-        params = settings.mpower[name]
         if cmd == 'status':
-            data = None
-            try:
-                data = mfi_ssh.get_all(*params)
-                self.status[name] = data
-                LOG.debug('%s data: %s', name, data)
+            state = self.devices[name].state()
+            LOG.debug('%s data: %s', name, state)
+            if 'sensors' in state:
+                data = self.convert_data(state['sensors'])
+                LOG.debug('data: %s', data)
+                self.state[name] = data
                 if time.time() - self.time.get(name, 0) > self.resend:
                     self.time[name] = time.time()
                     self.send_data(name, data)
-            except:
-                LOG.exception('status')
         else:
-            try:
-                mfi_ssh.switch(params[0], params[1], params[2], port, cmd.lower())
-            except:
-                LOG.exception('switch')
+            st = (0, 1)[cmd.lower() in ['on', '1', 'true']]
+            self.devices[name].set(port, output=st)
 
-    def convert_data(self, data):
+    @staticmethod
+    def convert_data(data):
         conv_data = {}
         for b in data:
             if 'port' in b:
@@ -166,7 +188,9 @@ class Main(object):
     pause = 0.5
 
     def __init__(self, server=None, port=None, user=None, password=None):
-        self.topics = {'x10/+/command': self.x10_cmd, 'mpower/switch/+/+/command': self.mpower_cmd}
+        signal.signal(signal.SIGUSR1, self.debug)
+        self.topics = {'x10/+/command': self.x10_cmd,
+                       'mpower/switch/+/+/command': self.mpower_cmd}
         if server:
             self.server = server
         if port:
@@ -195,7 +219,10 @@ class Main(object):
         payload = msg.payload.decode('utf-8')
         for t, cmd in self.topics.items():
             if match_topic(t, topic):
-                cmd(topic, payload)
+                try:
+                    cmd(topic, payload)
+                except:
+                    LOG.exception('')
                 break
 
     def x10_cmd(self, topic, payload):
@@ -204,13 +231,18 @@ class Main(object):
             cmd = payload.lower()
             addr = parts[1]
             LOG.info('got cmd %s to %s', cmd, addr)
-            self.x10_tester.commands.append((addr, cmd))
+            self.x10_tester.add_command((addr, cmd))
 
     def mpower_cmd(self, topic, payload):
         parts = topic.split('/')
         name = parts[2]
         port = int(parts[3])
-        self.mfi_tester.commands.append((name, port, payload))
+        self.mfi_tester.add_command((name, port, payload))
+
+    def debug(self, sig, stack):
+        with open('running_stack', 'w') as f:
+            f.write('Debug\n\n')
+            traceback.print_stack(stack, file=f)
 
     def main(self):
         if self.user:
